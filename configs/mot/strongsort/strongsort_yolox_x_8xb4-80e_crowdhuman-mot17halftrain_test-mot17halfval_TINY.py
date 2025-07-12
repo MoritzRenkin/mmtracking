@@ -1,5 +1,5 @@
 _base_ = [
-    'mmdet::yolox/yolox_tiny_8xb8-300e_coco.py',   # <— was yolox_x_8x8.py
+    '../../_base_/models/yolox_s_8xb8-300e_coco.py',   #  yolox_x_8x8.py
     '../../_base_/datasets/mot_challenge.py', '../../_base_/default_runtime.py'
 ]
 
@@ -19,12 +19,12 @@ model = dict(
         ]),
     detector=dict(
         _scope_='mmdet',
-        bbox_head=dict(num_classes=1),
-        test_cfg=dict(score_thr=0.35, nms=dict(type='nms', iou_threshold=0.7)),
+        bbox_head=dict(num_classes=80),
+        test_cfg=dict(score_thr=0.01, nms=dict(type='nms', iou_threshold=0.7)),
         init_cfg=dict(
             type='Pretrained',
             checkpoint=  # noqa: E251
-            'https://download.openmmlab.com/mmtracking/mot/strongsort/mot_dataset/yolox_x_crowdhuman_mot17-private-half_20220812_192036-b6c9ce9a.pth'  # noqa: E501
+            'https://download.openmmlab.com/mmdetection/v2.0/yolox/yolox_s_8x8_300e_coco/yolox_s_8x8_300e_coco_20211121_095711-4592a793.pth'  # noqa: E501
         )),
     kalman=dict(type='KalmanFilter', center_only=False, use_nsa=True),
     cmc=dict(
@@ -60,7 +60,7 @@ model = dict(
         )),
     tracker=dict(
         type='StrongSORTTracker',
-        obj_score_thr=0.8,
+        obj_score_thr=0.6,
         reid=dict(
             num_samples=None,
             img_scale=(256, 128),
@@ -88,6 +88,7 @@ test_pipeline = [
         type='mmdet.Pad',
         size_divisor=32,
         pad_val=dict(img=(114.0, 114.0, 114.0))),
+    #dict(type='FilterDetections', classes=[0]),
     dict(type='PackTrackInputs', pack_single_img=True)
 ]
 
