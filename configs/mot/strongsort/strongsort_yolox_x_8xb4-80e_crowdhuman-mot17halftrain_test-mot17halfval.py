@@ -18,7 +18,7 @@ model = dict(
     detector=dict(
         _scope_='mmdet',
         bbox_head=dict(num_classes=1),
-        test_cfg=dict(score_thr=0.01, nms=dict(type='nms', iou_threshold=0.7)),
+        test_cfg=dict(score_thr=0.5, nms=dict(type='nms', iou_threshold=0.7)),
         init_cfg=dict(
             type='Pretrained',
             checkpoint=  # noqa: E251
@@ -76,7 +76,7 @@ model = dict(
 
 dataset_type = 'MOTChallengeDataset'
 data_root = 'data/MOT17/'
-img_scale = (800, 1440)
+img_scale = (640, 640) #(800, 1440)
 
 test_pipeline = [
     dict(type='LoadImageFromFile'),
@@ -118,7 +118,7 @@ val_evaluator = dict(postprocess_tracklet_cfg=[
         checkpoint=  # noqa: E251
         'https://download.openmmlab.com/mmtracking/mot/strongsort/mot_dataset/aflink_motchallenge_20220812_190310-a7578ad3.pth',  # noqa: E501
         temporal_threshold=(0, 30),
-        spatial_threshold=50,
+        spatial_threshold=34,#50,
         confidence_threshold=0.95,
     ),
     dict(
