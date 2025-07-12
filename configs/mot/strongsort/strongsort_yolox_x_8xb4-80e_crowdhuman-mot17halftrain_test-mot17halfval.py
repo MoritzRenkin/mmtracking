@@ -81,6 +81,7 @@ img_scale = (800, 1440)
 test_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='mmdet.Resize', scale=img_scale, keep_ratio=True),
+    dict(type='mmdet.Resize', scale=img_scale, keep_ratio=True),
     dict(
         type='mmdet.Pad',
         size_divisor=32,
