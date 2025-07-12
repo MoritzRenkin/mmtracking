@@ -6,7 +6,9 @@ import torch
 import torch.nn.functional as F
 from mmcv.cnn.bricks import ConvModule
 from mmcv.cnn.bricks.transformer import build_positional_encoding
-from mmdet.models.utils.transformer import Transformer
+from mmcv.cnn.bricks.transformer import TransformerLayerSequence
+
+from mmengine import ConfigDict
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -177,7 +179,7 @@ class ScoreHead(nn.Module):
 
 
 @MODELS.register_module()
-class StarkTransformer(Transformer):
+class StarkTransformer(TransformerLayerSequence):
     """The transformer head used in STARK. `STARK.
 
     <https://arxiv.org/abs/2103.17154>`_.
@@ -195,14 +197,95 @@ class StarkTransformer(Transformer):
             Defaults to None.
     """
 
-    def __init__(
-        self,
-        encoder: OptConfigType = None,
-        decoder: OptConfigType = None,
-        init_cfg: OptConfigType = None,
-    ):
-        super(StarkTransformer, self).__init__(
-            encoder=encoder, decoder=decoder, init_cfg=init_cfg)
+    from typing import Optional
+
+    import torch.nn as nn
+    from mmcv.cnn.bricks.transformer import (  # NEW
+        BaseTransformerLayer,
+        TransformerLayerSequence,
+        build_positional_encoding,
+    )
+    from mmengine.model import BaseModule  # lightweight parent that supports init_cfg
+    from mmengine.config import ConfigDict
+
+    OptConfigType = Optional[dict]
+
+    class StarkTransformer(BaseModule):  # ← formerly “Transformer”
+        """Drop-in replacement that keeps the old public interface."""
+
+        def __init__(
+                self,
+                encoder: OptConfigType = None,
+                decoder: OptConfigType = None,
+                init_cfg: OptConfigType = None,
+        ):
+            # ------------------------------
+            # 0. call the new lightweight base
+            # ------------------------------
+            super().__init__(init_cfg=init_cfg)
+
+            # ------------------------------
+            # 1. fill default configs (kept identical to the original)
+            # ------------------------------
+            if encoder is None:
+                encoder = dict(
+                    num_layers=6,
+                    transformerlayers=dict(
+                        type='BaseTransformerLayer',
+                        attn_cfgs=dict(
+                            type='MultiheadAttention',
+                            embed_dims=256,
+                            num_heads=8,
+                            dropout=0.1),
+                        ffn_cfgs=dict(
+                            embed_dims=256,
+                            feedforward_channels=2048,
+                            ffn_dropout=0.1,
+                            add_identity=True),
+                        operation_order=('self_attn', 'norm', 'ffn', 'norm')),
+                    positional_encoding=dict(
+                        type='SinePositionalEncoding',
+                        num_feats=128,
+                        normalize=True)
+                )
+
+            if decoder is None:
+                decoder = dict(
+                    num_layers=6,
+                    return_intermediate=True,
+                    transformerlayers=dict(
+                        type='BaseTransformerLayer',
+                        attn_cfgs=[
+                            dict(type='MultiheadAttention',
+                                 embed_dims=256, num_heads=8, dropout=0.1),  # self-attn
+                            dict(type='MultiheadAttention',
+                                 embed_dims=256, num_heads=8, dropout=0.1)  # cross-attn
+                        ],
+                        ffn_cfgs=dict(
+                            embed_dims=256,
+                            feedforward_channels=2048,
+                            ffn_dropout=0.1,
+                            add_identity=True),
+                        operation_order=('self_attn', 'norm',
+                                         'cross_attn', 'norm',
+                                         'ffn', 'norm'))
+                )
+
+            # keep copies of the (possibly user-supplied) cfgs
+            self.encoder_cfg = ConfigDict(encoder)
+            self.decoder_cfg = ConfigDict(decoder)
+
+            # ------------------------------
+            # 2. build the real modules
+            # ------------------------------
+            self.encoder = TransformerLayerSequence(**self.encoder_cfg)
+            self.decoder = TransformerLayerSequence(**self.decoder_cfg)
+
+            # ------------------------------
+            # 3. (optional) initialise weights if an init_cfg was given
+            # ------------------------------
+            if self.init_cfg is not None:
+                self.init_weights()
 
     def forward(self, x: Tensor, mask: Tensor, query_embed: Tensor,
                 pos_embed: Tensor) -> Tuple[Tensor, Tensor]:
@@ -240,27 +323,53 @@ class StarkTransformer(Transformer):
                 - enc_mem: Output results from encoder, with shape \
                       (feats_flatten_len, bs, embed_dims).
         """
-        _, bs, _ = x.shape
-        query_embed = query_embed.unsqueeze(1).repeat(
-            1, bs, 1)  # [num_query, embed_dims] -> [num_query, bs, embed_dims]
+        B, C, H, W = x.shape  # keep original var names
+        # ------------------------------------------------------------------
+        # 1. Flatten spatial dims and put sequence length first
+        # ------------------------------------------------------------------
+        src_flat = x.flatten(2).permute(2, 0, 1)  # (HW, B, C)
+        pos_flat = pos_embed.flatten(2).permute(2, 0, 1)  # (HW, B, C)
+        mask_flat = None if mask is None else mask.flatten(1)  # (B, HW)
 
-        enc_mem = self.encoder(
-            query=x,
+        # ------------------------------------------------------------------
+        # 2. Encoder
+        # ------------------------------------------------------------------
+        # TransformerLayerSequence follows the same argument order as the
+        # old MMDet-2.x `Transformer`: query/key/value + positional + mask.
+        memory_flat = self.encoder(
+            query=src_flat,
             key=None,
             value=None,
-            query_pos=pos_embed,
-            query_key_padding_mask=mask)
-        target = torch.zeros_like(query_embed)
-        # out_dec: [num_dec_layers, num_query, bs, embed_dims]
-        out_dec = self.decoder(
-            query=target,
-            key=enc_mem,
-            value=enc_mem,
-            key_pos=pos_embed,
+            query_pos=pos_flat,
+            key_padding_mask=mask_flat)
+
+        # ------------------------------------------------------------------
+        # 3. Prepare decoder inputs
+        # ------------------------------------------------------------------
+        #   • query_embed needs a batch dimension
+        #   • tgt is a zero tensor with the same shape
+        query_embed = query_embed.unsqueeze(1).repeat(1, B, 1)  # (Nq, B, C)
+        tgt = torch.zeros_like(query_embed)  # (Nq, B, C)
+
+        # ------------------------------------------------------------------
+        # 4. Decoder (returns all intermediate layers because we set
+        #    return_intermediate=True in __init__)
+        # ------------------------------------------------------------------
+        hs = self.decoder(
+            query=tgt,
+            key=memory_flat,
+            value=memory_flat,
             query_pos=query_embed,
-            key_padding_mask=mask)
-        out_dec = out_dec.transpose(1, 2)
-        return out_dec, enc_mem
+            key_pos=pos_flat,
+            key_padding_mask=mask_flat)  # → (L, B, Nq, C)
+
+        # ------------------------------------------------------------------
+        # 5. Reshape encoder output back to (B, C, H, W) so the rest of the
+        #    pipeline does not notice any change.
+        # ------------------------------------------------------------------
+        memory = memory_flat.permute(1, 2, 0).view(B, C, H, W)  # (B, C, H, W)
+
+        return memory, hs
 
 
 @MODELS.register_module()
